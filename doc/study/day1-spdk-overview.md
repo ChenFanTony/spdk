@@ -1,8 +1,21 @@
 # Day 1: SPDK Overview
 
+## What this day covers
+
+What SPDK is, what problem it solves, and how it differs from the Linux kernel storage
+path. This is the mental model foundation for everything that follows.
+
+Source references:
+
+- `doc/overview.md`
+- `doc/event.md`
+- `doc/bdev.md`
+
+---
+
 ## What SPDK is
 
-SPDK is a set of user-space storage libraries and applications. The code is mainly organized as:
+SPDK is a set of user-space storage libraries and applications. The code is organized as:
 
 - `lib`: core SPDK libraries
 - `include/spdk`: public headers
@@ -11,158 +24,218 @@ SPDK is a set of user-space storage libraries and applications. The code is main
 - `doc`: architecture and feature documentation
 - `test`: unit and functional tests
 
-Source reference:
+SPDK is not one binary. It is a framework of libraries that applications are built from.
+`nvmf_tgt` and `spdk_tgt` are applications that sit on top of the framework.
 
-- `doc/overview.md`
+---
 
-## Core architectural idea
+## The core architectural idea
 
-SPDK is designed around:
+SPDK is designed around four principles:
 
-- user-space execution
-- asynchronous I/O
-- polling instead of interrupt-driven/blocking model
-- message passing instead of heavy shared-state locking
+1. **user-space execution** — storage code runs in a process, not the kernel
+2. **asynchronous I/O** — no blocking, no waiting
+3. **polling instead of interrupts** — reactors spin continuously checking for work
+4. **message passing instead of locking** — threads communicate by sending work to each
+   other, not by taking shared locks
 
-The most important high-level statement in the docs is that SPDK is designed around message passing instead of locking. SPDK libraries depend on a threading abstraction, but are intentionally decoupled from one specific application framework.
+The most important of these is message passing. Every design decision in SPDK — why
+callbacks are everywhere, why state machines appear constantly, why there are no mutexes
+in the hot path — flows from this choice.
 
-This is the first mental shift compared with the Linux kernel storage path:
+---
 
-- Linux commonly relies on kernel threads, interrupts, scheduler decisions, and shared kernel subsystems
-- SPDK prefers explicit ownership, poll loops, callbacks, and cross-thread messages
+## The first mental shift: polling vs interrupts
+
+Linux storage path:
+
+```
+task submits I/O
+  -> sleeps or polls
+  -> interrupt fires on completion
+  -> wakes up or completion detected
+  -> continues
+```
+
+SPDK storage path:
+
+```
+request submitted
+  -> returns immediately (async)
+  -> reactor spins checking for completions
+  -> completion detected by poller
+  -> callback fires
+  -> next step executes
+```
+
+There is no sleeping. There is no interrupt handler wakeup. The reactor runs
+continuously. This trades CPU utilization on dedicated cores for dramatically lower
+and more predictable latency.
+
+---
+
+## The second mental shift: message passing vs locking
+
+Linux storage path (shared state):
+
+```
+thread A wants to modify shared struct
+  -> take mutex
+  -> modify struct
+  -> release mutex
+thread B blocks until mutex is available
+```
+
+SPDK (ownership + messages):
+
+```
+struct is owned by thread A
+thread B wants to modify it
+  -> thread B sends message to thread A
+  -> thread A processes message on its next loop
+  -> no mutex, no blocking
+```
+
+This is why SPDK code is full of callbacks and state machines. A multi-step operation
+that in kernel code might be a sequence of locked writes becomes a chain of messages,
+each one advancing a state machine one step.
+
+---
 
 ## Threading model at a high level
 
-SPDK provides a framework for asynchronous, polled-mode, shared-nothing server applications.
+SPDK provides a framework for asynchronous, polled-mode, shared-nothing server
+applications.
 
 Key concepts:
 
-- reactor: one event loop thread per CPU core
-- event: a message sent to a reactor
-- poller: a repeatedly executed callback on a thread
+- **reactor**: one event loop thread pinned to one CPU core, spinning forever
+- **spdk_thread**: a logical thread abstraction that runs on a reactor; multiple
+  `spdk_thread` objects can exist but each runs on one reactor at a time
+- **poller**: a callback registered on a thread and called on every reactor iteration
+- **event/message**: a function enqueued to run on a specific thread's next iteration
 
-The framework connects reactors with lockless queues and uses events for cross-thread communication.
+The reactor loop in pseudocode:
 
-Why this matters:
+```
+while (running) {
+    drain message queue
+    run all pollers
+    run timed pollers whose deadline has passed
+}
+```
 
-- event functions should be short and non-blocking
-- pollers replace many interrupt-driven patterns
-- concurrency is achieved through asynchronous operations and callback completion
-
-This is the second major mental shift:
-
-- not "sleep until work arrives"
-- instead "poll, dispatch, complete, and send messages"
-
-Source reference:
-
-- `doc/event.md`
+---
 
 ## Environment abstraction
 
-SPDK uses POSIX for many operations, but abstracts system-specific functionality behind the `env` layer.
+SPDK uses POSIX for many operations but abstracts system-specific functionality:
 
-Important examples:
+- PCI enumeration (via DPDK/VFIO)
+- DMA-safe memory allocation (hugepages)
 
-- PCI enumeration
-- DMA-safe memory allocation
+By default SPDK uses a DPDK-based environment. This is why `scripts/setup.sh` allocates
+hugepages and binds devices to VFIO before the target starts.
 
-By default, SPDK uses a DPDK-based environment implementation, but the architecture is intentionally abstracted.
-
-This means SPDK is not just "an application". It is a framework with portability and embedding in mind.
+---
 
 ## Application model
 
-SPDK applications usually:
+SPDK applications:
 
-- start with a small set of command-line options
-- initialize framework components
-- expose runtime configuration through JSON-RPC
+- start with `spdk_app_start`
+- initialize subsystems in dependency order
+- expose runtime configuration through JSON-RPC over a UNIX socket
 
-This is different from Linux configfs-based management. In SPDK, the normal operational model is:
+This differs from Linux nvmet which uses configfs. In SPDK:
 
-- start app
-- configure using RPC
-- inspect and modify state dynamically
+- start the application
+- configure using RPC calls
+- inspect and modify state dynamically at runtime
+- state is in-memory; scripts recreate it on restart
 
-## The role of bdev
+---
 
-The block device layer, or bdev, is the central storage abstraction for most SPDK services.
+## The bdev layer
+
+The block device layer (`bdev`) is the central storage abstraction for most SPDK services.
 
 The bdev layer provides:
 
-- a common API for block devices
-- pluggable modules for different backend types
-- a common interface for read, write, unmap, reset, and related operations
+- a common API for block devices (read, write, unmap, flush, reset)
+- pluggable modules for different backends (malloc, AIO, NVMe, lvol, RAID)
 - lockless queueing and asynchronous completion
-- JSON-RPC-based management
+- per-thread I/O channels to avoid contention
+- JSON-RPC management
 
-Conceptually, bdev in SPDK plays a role similar to the generic block layer in a traditional OS storage stack, but implemented as a user-space library.
+NVMf does not talk directly to hardware. It exports bdevs. The bdev module handles
+the actual hardware interaction. This means NVMf works identically regardless of whether
+the backend is a malloc buffer, an AIO file, or a bare-metal NVMe device.
 
-This is important because upper-layer services like NVMf usually do not talk directly to raw hardware. They export bdevs.
-
-Source reference:
-
-- `doc/bdev.md`
+---
 
 ## Big-picture stack
 
-A useful mental model is:
+```
+nvmf_tgt application
+    |
+    | JSON-RPC control plane
+    |
+SPDK application framework
+    |
+    +-- thread / reactor / poller model
+    |
+NVMf service (lib/nvmf/)
+    |
+    | spdk_bdev_read / write / unmap
+    |
+bdev framework (lib/bdev/)
+    |
+    +-- malloc bdev module
+    +-- AIO bdev module
+    +-- uring bdev module
+    +-- NVMe bdev module
+    +-- lvol bdev module
+    +-- RAID bdev module
+    |
+actual hardware or Linux block device / file
+```
 
-- SPDK application framework
-- thread/reactor/event/poller model
-- service modules such as NVMf
-- bdev framework
-- backend bdev modules such as malloc, aio, uring, nvme, lvol, raid
-- actual hardware or Linux-backed device/file
-
-For NVMf specifically:
-
-- NVMf receives a host command
-- resolves subsystem and namespace state
-- translates the operation into bdev I/O
-- the backing bdev module performs the actual operation
-- completion returns asynchronously
+---
 
 ## Comparison with Linux kernel storage
 
-Linux kernel model often looks like:
+| Linux kernel | SPDK |
+|---|---|
+| kernel threads, scheduler | reactors, pollers |
+| interrupt-driven completions | poller-driven completions |
+| `bio` / block layer | `spdk_bdev_io` / bdev layer |
+| mutex / spinlock for shared state | message passing, per-thread ownership |
+| configfs / sysfs management | JSON-RPC over UNIX socket |
+| module_init / module_exit | spdk_app_start / spdk_app_stop |
+| per-cpu variables for hot paths | per-thread io_channel |
 
-- syscall or block layer request
-- kernel block subsystem
-- driver
-- interrupt/completion
+This does not mean SPDK has no synchronization. It means the architecture minimizes
+contention by giving each thread ownership of its own state and communicating changes
+via messages rather than locks.
 
-SPDK model looks more like:
+---
 
-- user-space RPC/app control
-- user-space storage service
-- bdev abstraction
-- asynchronous request submission
-- poller/event-driven completion
+## What matters most after Day 1
 
-This does not mean "no synchronization exists". It means the architecture tries to minimize contention by:
-
-- per-thread ownership
-- message passing
-- local context
-- non-blocking operation
-
-## What matters most to remember after Day 1
-
-1. SPDK is a framework of libraries plus applications, not just one target binary.
-2. Message passing is a core design rule.
-3. Polling is fundamental to SPDK performance and concurrency.
-4. The event framework is optional, but its model explains how many SPDK apps behave.
-5. The bdev layer is the common storage abstraction that many higher-level services depend on.
-6. JSON-RPC is the normal runtime control plane.
+1. SPDK is a framework of libraries, not a single binary.
+2. Message passing is the core design rule — everything else follows from it.
+3. Polling replaces interrupt-driven completions.
+4. The bdev layer is the central storage abstraction that NVMf and all other services
+   depend on.
+5. JSON-RPC is the runtime control plane — there is no configfs equivalent.
+6. State is in-memory. Restart means re-running your configuration script.
 7. To understand NVMf well, you must first understand thread/reactor/poller and bdev.
+
+---
 
 ## Suggested next step
 
-Day 2 should focus on:
-
-- application startup
-- subsystem initialization
-- RPC control flow
-- how `spdk_tgt` and `nvmf_tgt` fit on top of the framework
+Day 2: application framework. Learn how `spdk_app_start` initializes subsystems in
+order, how the RPC socket becomes available, and what the startup sequence of
+`nvmf_tgt` looks like from process launch to RPC-ready state.
